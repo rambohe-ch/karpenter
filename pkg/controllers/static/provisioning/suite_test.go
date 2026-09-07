@@ -52,6 +52,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
+	"sigs.k8s.io/karpenter/pkg/utils/resources"
 	. "sigs.k8s.io/karpenter/pkg/utils/testing"
 )
 
@@ -616,8 +617,28 @@ var _ = Describe("Static Provisioning Controller", func() {
 			nodeClaims := &v1.NodeClaimList{}
 			Expect(env.Client.List(ctx, nodeClaims)).To(Succeed())
 			Expect(nodeClaims.Items).To(HaveLen(0))
-			// The node count reservation must not leak when we skip provisioning
 			ExpectStateNodePoolCount(cluster, nodePool.Name, 0, 0, 0)
+		})
+		It("should release the node count reservation when no offering is available", func() {
+			nodePool := test.StaticNodePool(v1.NodePool{
+				Spec: v1.NodePoolSpec{Limits: v1.Limits{resources.Node: resource.MustParse("2")}},
+			})
+			nodePool.Spec.Replicas = new(int64(2))
+			cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{
+				fake.NewInstanceType("unavailable-instance-type", fake.WithOfferings(unavailableOfferings()...)),
+			}
+			ExpectApplied(ctx, env.Client, nodePool)
+
+			ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+			nodeClaims := &v1.NodeClaimList{}
+			Expect(env.Client.List(ctx, nodeClaims)).To(Succeed())
+			Expect(nodeClaims.Items).To(HaveLen(0))
+
+			// A reservation leaked by the skipped attempt would consume the node limit and block this one
+			cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{fake.NewInstanceType("available-instance-type")}
+			ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+			Expect(env.Client.List(ctx, nodeClaims)).To(Succeed())
+			Expect(nodeClaims.Items).To(HaveLen(2))
 		})
 		It("should not create nodeclaims when the only available offerings belong to an incompatible instance type", func() {
 			nodePool := test.ReplaceRequirements(test.StaticNodePool(), v1.NodeSelectorRequirementWithMinValues{
@@ -654,17 +675,31 @@ var _ = Describe("Static Provisioning Controller", func() {
 			Expect(env.Client.List(ctx, nodeClaims)).To(Succeed())
 			Expect(nodeClaims.Items).To(HaveLen(2))
 		})
-		It("should create nodeclaims when the cloudprovider fails to resolve instance types", func() {
+		It("should return an error when the cloudprovider fails to resolve instance types", func() {
 			nodePool := test.StaticNodePool()
 			nodePool.Spec.Replicas = new(int64(2))
 			cloudProvider.ErrorsForNodePool[nodePool.Name] = fmt.Errorf("failed resolving instance types")
 			ExpectApplied(ctx, env.Client, nodePool)
 
-			ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+			err := ExpectObjectReconcileFailed(ctx, env.Client, controller, nodePool)
+			Expect(err.Error()).To(ContainSubstring("checking offering availability"))
 
 			nodeClaims := &v1.NodeClaimList{}
 			Expect(env.Client.List(ctx, nodeClaims)).To(Succeed())
-			Expect(nodeClaims.Items).To(HaveLen(2))
+			Expect(nodeClaims.Items).To(HaveLen(0))
+		})
+		It("should requeue without erroring when the nodepool is awaiting nodeoverlay evaluation", func() {
+			nodePool := test.StaticNodePool()
+			nodePool.Spec.Replicas = new(int64(2))
+			cloudProvider.ErrorsForNodePool[nodePool.Name] = cloudprovider.NewUnevaluatedNodePoolError(nodePool.Name)
+			ExpectApplied(ctx, env.Client, nodePool)
+
+			result := ExpectObjectReconciled(ctx, env.Client, controller, nodePool)
+			Expect(result.RequeueAfter).To(BeNumerically("~", time.Second, time.Millisecond*100))
+
+			nodeClaims := &v1.NodeClaimList{}
+			Expect(env.Client.List(ctx, nodeClaims)).To(Succeed())
+			Expect(nodeClaims.Items).To(HaveLen(0))
 		})
 		It("should not create nodeclaims when the cloudprovider resolves no instance types", func() {
 			nodePool := test.StaticNodePool()
